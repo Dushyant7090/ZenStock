@@ -348,7 +348,7 @@ def display_dashboard(df, demand_multiplier=1.0, lead_time_days: int = 7, profit
     dashboard_df = dashboard_df[existing_cols]
 
     styled_df = dashboard_df.style.applymap(style_status, subset=['Status'])
-    st.dataframe(styled_df, use_container_width=True)
+    st.dataframe(styled_df, width="stretch")
     
     return dashboard_df
 
@@ -512,7 +512,7 @@ def main():
             # Create and display forecast chart
             chart = create_forecast_chart(df, selected_product, demand_multiplier)
             if chart:
-                st.plotly_chart(chart, use_container_width=True)
+                st.plotly_chart(chart, width="stretch")
             else:
                 st.warning("Unable to generate forecast chart for this product.")
         
