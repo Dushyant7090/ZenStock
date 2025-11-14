@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+import time
 
 try:  # pragma: no cover - optional dependency
     from supabase import Client, create_client
@@ -16,6 +17,55 @@ except Exception:  # pragma: no cover - handled gracefully at runtime
     Client = None  # type: ignore
     create_client = None  # type: ignore
     SUPABASE_AVAILABLE = False
+
+
+AUTH_CSS = """
+<style>
+body, .stApp {
+    background-color: #0d0f15 !important;
+    color: #e6e6e6 !important;
+}
+.auth-box {
+    padding: 28px;
+    background: #161a23;
+    border-radius: 14px;
+    box-shadow: 0 0 25px rgba(0,0,0,0.45);
+    margin-top: 20px;
+}
+input {
+    background-color: #0f1219 !important;
+    color: #e6e6e6 !important;
+    border-radius: 8px !important;
+}
+.stButton>button {
+    background: linear-gradient(135deg, #3a3f4b, #282c34);
+    color: white;
+    transition: all 0.25s ease;
+    border: none;
+}
+.stButton>button:hover {
+    background: linear-gradient(135deg, #4f5a6e, #313843);
+    transform: translateY(-2px);
+}
+.stTabs [data-baseweb="tab"] {
+    color: #9ea3b5 !important;
+    font-size: 16px !important;
+}
+.stTabs [aria-selected="true"] {
+    color: white !important;
+    border-bottom: 2px solid #4c82ff !important;
+}
+.success-anim {
+    font-size: 23px;
+    text-align: center;
+    animation: pop 0.45s ease-out forwards;
+}
+@keyframes pop {
+    0% { transform: scale(0.2); opacity: 0; }
+    100% { transform: scale(1); opacity: 1; }
+}
+</style>
+"""
 
 
 __all__ = [
@@ -87,48 +137,58 @@ def get_supabase_client() -> Optional['Client']:
 
 
 def auth_ui(sb: 'Client') -> bool:
-    """Render Supabase auth controls. Returns True when user is authenticated."""
+    """Render Supabase auth controls with dark theme. Returns True if user is authenticated."""
+    st.markdown(AUTH_CSS, unsafe_allow_html=True)
+
     if 'sb_user' not in st.session_state:
         st.session_state['sb_user'] = None
 
-    if st.session_state['sb_user']:
-        st.sidebar.markdown(f"🟢 Logged in as {st.session_state['sb_user'].get('email','user')}")
-        if st.sidebar.button("Logout"):
-            try:
-                sb.auth.sign_out()
-            except Exception:
-                pass
-            st.session_state['sb_user'] = None
-            st.session_state.pop('sb_access_token', None)
-            st.session_state.pop('sb_refresh_token', None)
-            st.rerun()
+    user = st.session_state['sb_user']
+    if user:
+        with st.sidebar:
+            st.markdown(f"🟢 **Logged in as {user.get('email', 'user')}**")
+            if st.button("Logout"):
+                try:
+                    sb.auth.sign_out()
+                except Exception:
+                    pass
+                st.session_state['sb_user'] = None
+                st.session_state.pop('sb_access_token', None)
+                st.session_state.pop('sb_refresh_token', None)
+                st.rerun()
         return True
 
-    st.markdown("### 🔐 Login to continue")
-    tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
-    with tab_login:
+    st.markdown("<div class='auth-box'>", unsafe_allow_html=True)
+    auth_mode_default = st.session_state.get('auth_mode', 'Login')
+    auth_mode = st.radio(
+        "",
+        options=["Login", "Sign Up"],
+        index=0 if auth_mode_default != "Sign Up" else 1,
+        horizontal=True,
+        key="auth_mode_selector",
+    )
+    st.session_state['auth_mode'] = auth_mode
+    heading = "## 🔐 Login to Continue" if auth_mode == "Login" else "## ✨ Create an Account"
+    st.markdown(heading)
+
+    if auth_mode == "Login":
         email = st.text_input("Email", key="login_email")
         password = st.text_input("Password", type="password", key="login_password")
         if st.button("Login"):
             try:
                 res = sb.auth.sign_in_with_password({"email": email, "password": password})
                 user = getattr(res, 'user', None)
-                try:
-                    session = getattr(res, 'session', None)
-                    if session:
-                        at = getattr(session, 'access_token', None)
-                        rt = getattr(session, 'refresh_token', None)
-                        if at and rt:
-                            st.session_state['sb_access_token'] = at
-                            st.session_state['sb_refresh_token'] = rt
-                except Exception:
-                    pass
+                session = getattr(res, 'session', None)
+                if session:
+                    st.session_state['sb_access_token'] = getattr(session, 'access_token', None)
+                    st.session_state['sb_refresh_token'] = getattr(session, 'refresh_token', None)
                 if user and getattr(user, 'email', None):
+                    st.markdown("<div class='success-anim'>🎉 Login Successful!</div>", unsafe_allow_html=True)
+                    time.sleep(0.8)
                     st.session_state['sb_user'] = {"email": user.email, "id": getattr(user, 'id', None)}
-                    st.success("Logged in successfully!")
                     st.rerun()
                 else:
-                    st.error("Invalid credentials.")
+                    st.error("Invalid email or password.")
                     st.session_state['show_forgot_btn'] = True
                     st.session_state['show_forgot'] = False
             except Exception as exc:
@@ -142,35 +202,29 @@ def auth_ui(sb: 'Client') -> bool:
             st.session_state['show_forgot_btn'] = False
 
         if st.session_state['show_forgot']:
-            st.caption("Forgot your password? Send a reset link to your email.")
+            st.caption("Enter your email to receive a password reset link.")
             fp_email = st.text_input("Reset Email", value=email or "", key="forgot_email")
             redirect_url = _read_secret("SUPABASE_REDIRECT_URL")
-            cols = st.columns([1, 1])
-            with cols[0]:
-                if st.button("Send reset link"):
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("Send Reset Link"):
                     if not fp_email:
-                        st.warning("Please enter your email to receive the reset link.")
+                        st.warning("Please enter your email.")
                     else:
                         try:
-                            if redirect_url:
-                                sb.auth.reset_password_for_email(fp_email, options={"redirect_to": redirect_url})
+                            options = {"redirect_to": redirect_url} if redirect_url else None
+                            if options:
+                                sb.auth.reset_password_for_email(fp_email, options=options)
                             else:
                                 sb.auth.reset_password_for_email(fp_email)
-                            st.success("Reset link sent successfully, check your email")
+                            st.success("Reset link sent successfully. Check your email.")
                             st.session_state['show_forgot'] = False
                             st.session_state['show_forgot_btn'] = False
                             st.rerun()
-                        except Exception as e1:
-                            try:
-                                sb.auth.reset_password_email(fp_email)
-                                st.success("Reset link sent successfully, check your email")
-                                st.session_state['show_forgot'] = False
-                                st.session_state['show_forgot_btn'] = False
-                                st.rerun()
-                            except Exception as e2:
-                                st.error(f"Failed to send reset email: {e1 or e2}")
-            with cols[1]:
-                if st.button("Back to login"):
+                        except Exception as exc:
+                            st.error(f"Failed to send reset email: {exc}")
+            with col2:
+                if st.button("Back to Login"):
                     st.session_state['show_forgot'] = False
                     st.session_state['show_forgot_btn'] = False
                     st.rerun()
@@ -180,18 +234,20 @@ def auth_ui(sb: 'Client') -> bool:
                 st.session_state['show_forgot'] = True
                 st.rerun()
 
-    with tab_signup:
+    else:
         s_email = st.text_input("Email", key="signup_email")
         s_password = st.text_input("Password", type="password", key="signup_password")
         if st.button("Create Account"):
             try:
                 res = sb.auth.sign_up({"email": s_email, "password": s_password})
                 if getattr(res, 'user', None):
-                    st.success("Account created! Check your email to confirm if required, then login.")
+                    st.success("Account created! Check your email to confirm, then login.")
                 else:
-                    st.info("Signup initiated. Check your email to confirm.")
+                    st.info("Signup initiated. Verify via email.")
             except Exception as exc:
                 st.error(f"Signup failed: {exc}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
     return False
 
 
