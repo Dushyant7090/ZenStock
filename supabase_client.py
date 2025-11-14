@@ -40,8 +40,26 @@ def _read_secret(key: str, default: str = "") -> str:
         return default
 
 
+def _ensure_supabase_import() -> None:
+    """Best-effort lazy import so newly installed packages work without restart."""
+    global Client, create_client, SUPABASE_AVAILABLE
+    if Client is not None and create_client is not None:
+        return
+    try:
+        from supabase import Client as _Client, create_client as _create_client  # type: ignore
+
+        Client = _Client
+        create_client = _create_client
+        SUPABASE_AVAILABLE = True
+    except Exception:
+        SUPABASE_AVAILABLE = False
+        Client = None
+        create_client = None
+
+
 def get_supabase_client() -> Optional['Client']:
     """Return an initialized Supabase client or None if unavailable."""
+    _ensure_supabase_import()
     if not SUPABASE_AVAILABLE:
         st.info("Supabase client not installed. Run: pip install supabase")
         return None
