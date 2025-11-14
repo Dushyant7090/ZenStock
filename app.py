@@ -11,9 +11,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import warnings
 import smtplib
@@ -23,6 +20,29 @@ from io import BytesIO
 import os
 from dotenv import load_dotenv
 import json
+
+from services import (
+    load_csv,
+    preprocess_data,
+    generate_sample_data,
+    forecast_stock,
+    predict_stock_zero_date,
+    get_status_color,
+    calculate_reorder_date,
+    calculate_loss_per_day,
+    create_forecast_chart,
+)
+from supabase_client import (
+    SUPABASE_AVAILABLE,
+    get_supabase_client,
+    auth_ui,
+    supabase_insert_alerts,
+    supabase_log_notification,
+    supabase_sync_products_and_sales,
+    supabase_storage_upload,
+    handle_password_reset,
+)
+
 try:
     # Optional PDF support
     from reportlab.lib.pagesizes import A4
@@ -32,21 +52,6 @@ except Exception:
     REPORTLAB_AVAILABLE = False
 load_dotenv()  # Load variables from .env if present
 warnings.filterwarnings('ignore')
-
-# Try to import Prophet, fallback to simple forecasting if not available
-try:
-    from prophet import Prophet
-    PROPHET_AVAILABLE = True
-except ImportError:
-    PROPHET_AVAILABLE = False
-    st.warning("⚠️ Prophet not installed. Using simple moving average for forecasting.")
-
-# Try to import Supabase client
-try:
-    from supabase import create_client, Client
-    SUPABASE_AVAILABLE = True
-except Exception:
-    SUPABASE_AVAILABLE = False
 
 # Page configuration
 st.set_page_config(
@@ -127,294 +132,6 @@ def ingest_hash_into_query():
     )
 
 
-def load_csv(uploaded_file):
-    """
-    Load and validate CSV file with sales data
-    Accepts either original or MVP naming and normalizes to:
-      Date, Product, Quantity Sold, Current Stock
-    """
-    try:
-        df = pd.read_csv(uploaded_file)
-
-        # Normalize column names: lower, strip, replace spaces/underscores
-        col_map = {c: c for c in df.columns}
-        norm = {c: c.strip().lower().replace(' ', '_') for c in df.columns}
-
-        # Determine mappings to standard names
-        std_cols = {
-            'date': None,
-            'product': None,
-            'quantity_sold': None,
-            'current_stock': None,
-        }
-        for orig, n in norm.items():
-            if n in ('date',):
-                std_cols['date'] = orig
-            elif n in ('product',):
-                std_cols['product'] = orig
-            elif n in ('quantity_sold', 'sales', 'qty_sold', 'quantity'):
-                std_cols['quantity_sold'] = orig
-            elif n in ('current_stock', 'current__stock', 'stock', 'stock_on_hand'):
-                std_cols['current_stock'] = orig
-
-        missing = [k for k, v in std_cols.items() if v is None]
-        if missing:
-            st.error(f"Missing required columns (after normalization): {missing}. Expected one of the aliases for each.")
-            return None
-
-        # Rename to standard headers used across the app
-        df = df.rename(columns={
-            std_cols['date']: 'Date',
-            std_cols['product']: 'Product',
-            std_cols['quantity_sold']: 'Quantity Sold',
-            std_cols['current_stock']: 'Current Stock',
-        })
-
-        return df
-    except Exception as e:
-        st.error(f"Error loading CSV: {str(e)}")
-        return None
-
-def preprocess_data(df):
-    """
-    Clean and preprocess the sales data
-    """
-    try:
-        # Convert Date column to datetime
-        df['Date'] = pd.to_datetime(df['Date'])
-        
-        # Ensure numeric columns are properly typed
-        df['Quantity Sold'] = pd.to_numeric(df['Quantity Sold'], errors='coerce')
-        df['Current Stock'] = pd.to_numeric(df['Current Stock'], errors='coerce')
-        
-        # Remove rows with missing values
-        df = df.dropna()
-        
-        # Sort by date
-        df = df.sort_values('Date')
-        
-        return df
-    except Exception as e:
-        st.error(f"Error preprocessing data: {str(e)}")
-        return None
-
-def calculate_daily_sales(df):
-    """
-    Calculate average daily sales for each product
-    """
-    daily_sales = df.groupby(['Product', 'Date'])['Quantity Sold'].sum().reset_index()
-    avg_daily_sales = daily_sales.groupby('Product')['Quantity Sold'].mean().reset_index()
-    avg_daily_sales.columns = ['Product', 'Avg Daily Sales']
-    
-    return avg_daily_sales
-
-def forecast_stock_prophet(product_data, days_ahead=30):
-    """
-    Use Prophet to forecast stock depletion for a specific product
-    """
-    if not PROPHET_AVAILABLE or len(product_data) < 10:
-        return forecast_stock_simple(product_data, days_ahead)
-    
-    try:
-        # Prepare data for Prophet
-        prophet_data = product_data.groupby('Date')['Quantity Sold'].sum().reset_index()
-        prophet_data.columns = ['ds', 'y']
-        
-        # Create and fit the model
-        model = Prophet(daily_seasonality=True, yearly_seasonality=False)
-        model.fit(prophet_data)
-        
-        # Make future predictions
-        future = model.make_future_dataframe(periods=days_ahead)
-        forecast = model.predict(future)
-        
-        # Get the predicted daily sales
-        future_sales = forecast[forecast['ds'] > prophet_data['ds'].max()]['yhat'].values
-        avg_predicted_sales = max(future_sales.mean(), 0.1)  # Ensure positive
-        
-        return avg_predicted_sales
-    except:
-        return forecast_stock_simple(product_data, days_ahead)
-
-def forecast_stock_simple(product_data, days_ahead=30):
-    """
-    Simple moving average forecasting as fallback
-    """
-    recent_sales = product_data['Quantity Sold'].tail(7).mean()
-    return max(recent_sales, 0.1)  # Ensure positive
-
-def forecast_stock(product_data, days_ahead=30):
-    """
-    API-aligned wrapper to estimate daily sales rate for a product.
-    Chooses Prophet when available and data is sufficient; otherwise falls back to simple average.
-    Returns a positive daily sales rate (float).
-    """
-    if PROPHET_AVAILABLE and len(product_data) >= 10:
-        return forecast_stock_prophet(product_data, days_ahead)
-    return forecast_stock_simple(product_data, days_ahead)
-
-def predict_stock_zero_date(current_stock, daily_sales_rate):
-    """
-    Predict when stock will reach zero
-    """
-    if daily_sales_rate <= 0:
-        return None
-    
-    days_until_zero = current_stock / daily_sales_rate
-    zero_date = datetime.now() + timedelta(days=days_until_zero)
-    
-    return zero_date, days_until_zero
-
-def get_status_color(days_until_zero):
-    """
-    Determine status color based on days until stock zero
-    """
-    if days_until_zero < 7:
-        return "🔴 Critical", "status-red"
-    elif days_until_zero < 14:
-        return "🟡 Warning", "status-yellow"
-    else:
-        return "🟢 Safe", "status-green"
-
-def calculate_reorder_date(stock_zero_date: datetime, lead_time_days: int) -> datetime:
-    """
-    Reorder Date = Stock-Out Date - Lead Time days
-    """
-    try:
-        return stock_zero_date - timedelta(days=lead_time_days)
-    except Exception:
-        return None
-
-def calculate_loss_per_day(avg_daily_sales: float, profit_per_unit: float) -> float:
-    """
-    Potential revenue loss per day if stockout happens.
-    """
-    return max(0.0, avg_daily_sales) * max(0.0, profit_per_unit)
-
-def demand_simulator(multiplier: float) -> float:
-    """
-    Simple demand simulator API. Stores the multiplier in session state and returns it.
-    The rest of the app reads this multiplier to scale forecasts and update visuals.
-    """
-    st.session_state['demand_multiplier'] = multiplier
-    return multiplier
-
-def send_email(smtp_server: str, smtp_port: int, username: str, password: str,
-               to_email: str, subject: str, body: str, use_tls: bool = True) -> bool:
-    """
-    Send an email using basic SMTP. Returns True on success, False otherwise.
-    """
-    try:
-        msg = MIMEText(body, 'plain')
-        msg['Subject'] = subject
-        msg['From'] = username
-        msg['To'] = to_email
-
-        server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-        if use_tls:
-            server.starttls()
-        if username:
-            server.login(username, password)
-        server.sendmail(username, [to_email], msg.as_string())
-        server.quit()
-        return True
-    except Exception as e:
-        st.error(f"Email send failed: {e}")
-        return False
-
-def create_forecast_chart(df, product_name, demand_multiplier=1.0):
-    """
-    Create a forecast visualization chart for a specific product
-    """
-    product_data = df[df['Product'] == product_name].copy()
-    
-    if len(product_data) == 0:
-        return None
-    
-    # Historical data
-    historical = product_data.groupby('Date')['Quantity Sold'].sum().reset_index()
-    
-    # Forecast future sales
-    if PROPHET_AVAILABLE and len(historical) >= 10:
-        try:
-            prophet_data = historical.copy()
-            prophet_data.columns = ['ds', 'y']
-            
-            model = Prophet(daily_seasonality=True, yearly_seasonality=False)
-            model.fit(prophet_data)
-            
-            future = model.make_future_dataframe(periods=30)
-            forecast = model.predict(future)
-            
-            # Apply demand multiplier to forecast
-            forecast.loc[forecast['ds'] > prophet_data['ds'].max(), 'yhat'] *= demand_multiplier
-            
-            fig = go.Figure()
-            
-            # Historical data
-            fig.add_trace(go.Scatter(
-                x=historical['Date'],
-                y=historical['Quantity Sold'],
-                mode='lines+markers',
-                name='Historical Sales',
-                line=dict(color='blue')
-            ))
-            
-            # Forecast
-            future_forecast = forecast[forecast['ds'] > historical['Date'].max()]
-            fig.add_trace(go.Scatter(
-                x=future_forecast['ds'],
-                y=future_forecast['yhat'],
-                mode='lines',
-                name=f'Forecast (Demand x{demand_multiplier})',
-                line=dict(color='red', dash='dash')
-            ))
-            
-            fig.update_layout(
-                title=f'Sales Forecast for {product_name}',
-                xaxis_title='Date',
-                yaxis_title='Quantity Sold',
-                hovermode='x unified'
-            )
-            
-            return fig
-        except Exception:
-            # Fall back to simple method below
-            pass
-
-    # Simple forecast fallback
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=historical['Date'],
-        y=historical['Quantity Sold'],
-        mode='lines+markers',
-        name='Historical Sales',
-        line=dict(color='blue')
-    ))
-    
-    # Simple trend line
-    avg_sales = historical['Quantity Sold'].mean() * demand_multiplier
-    future_dates = pd.date_range(start=historical['Date'].max() + timedelta(days=1), periods=30)
-    future_sales = [avg_sales] * 30
-    
-    fig.add_trace(go.Scatter(
-        x=future_dates,
-        y=future_sales,
-        mode='lines',
-        name=f'Simple Forecast (Demand x{demand_multiplier})',
-        line=dict(color='red', dash='dash')
-    ))
-    
-    fig.update_layout(
-        title=f'Sales Forecast for {product_name}',
-        xaxis_title='Date',
-        yaxis_title='Quantity Sold',
-        hovermode='x unified'
-    )
-    
-    return fig
-
 def generate_purchase_order(dashboard_data: pd.DataFrame,
                             supplier_name: str,
                             days_coverage: int = 30):
@@ -469,35 +186,91 @@ def generate_purchase_order(dashboard_data: pd.DataFrame,
 
     return csv_bytes, pdf_bytes
 
-def generate_sample_data():
+def demand_simulator(multiplier: float) -> float:
     """
-    Generate sample sales data for demo purposes
+    Simple demand simulator API. Stores the multiplier in session state and returns it.
+    The rest of the app reads this multiplier to scale forecasts and update visuals.
     """
-    products = ['Widget A', 'Widget B', 'Widget C']
-    dates = pd.date_range(start='2024-08-01', end='2024-08-30', freq='D')
-    
-    data = []
-    current_stocks = {'Widget A': 150, 'Widget B': 75, 'Widget C': 200}
-    
-    for date in dates:
-        for product in products:
-            # Simulate realistic sales patterns
-            base_sales = {'Widget A': 8, 'Widget B': 12, 'Widget C': 5}[product]
-            
-            # Add some randomness and weekly patterns
-            weekend_factor = 0.7 if date.weekday() >= 5 else 1.0
-            random_factor = np.random.normal(1.0, 0.3)
-            
-            quantity_sold = max(0, int(base_sales * weekend_factor * random_factor))
-            
-            data.append({
-                'Date': date.strftime('%Y-%m-%d'),
-                'Product': product,
-                'Quantity Sold': quantity_sold,
-                'Current Stock': current_stocks[product]
-            })
-    
-    return pd.DataFrame(data)
+    st.session_state['demand_multiplier'] = multiplier
+    return multiplier
+
+def send_email(smtp_server: str, smtp_port: int, username: str, password: str,
+               to_email: str, subject: str, body: str, use_tls: bool = True) -> bool:
+    """
+    Send an email using basic SMTP. Returns True on success, False otherwise.
+    """
+    try:
+        msg = MIMEText(body, 'plain')
+        msg['Subject'] = subject
+        msg['From'] = username
+        msg['To'] = to_email
+
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+        if use_tls:
+            server.starttls()
+        if username:
+            server.login(username, password)
+        server.sendmail(username, [to_email], msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        st.error(f"Email send failed: {e}")
+        return False
+
+
+def send_push_notification(
+    channel: str,
+    message: str,
+    *,
+    twilio_sid: str | None = None,
+    twilio_token: str | None = None,
+    twilio_from: str | None = None,
+    twilio_to: str | None = None,
+    slack_webhook: str | None = None,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
+) -> bool:
+    """Dispatch push notifications to the configured channel."""
+    try:
+        if channel == 'WhatsApp (Twilio)':
+            if not all([twilio_sid, twilio_token, twilio_from, twilio_to]):
+                st.error("Provide Twilio SID, token, from, and to numbers.")
+                return False
+            url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+            data = {
+                'From': twilio_from,
+                'To': twilio_to,
+                'Body': message,
+            }
+            resp = requests.post(url, data=data, auth=(twilio_sid, twilio_token), timeout=15)
+            if resp.status_code >= 400:
+                st.error(f"Twilio send failed: {resp.text}")
+                return False
+            return True
+
+        if channel == 'Slack Webhook':
+            if not slack_webhook:
+                st.error("Provide Slack webhook URL.")
+                return False
+            resp = requests.post(slack_webhook, json={'text': message}, timeout=15)
+            if resp.status_code >= 400:
+                st.error(f"Slack send failed: {resp.text}")
+                return False
+            return True
+
+        # Telegram
+        if not all([telegram_bot_token, telegram_chat_id]):
+            st.error("Provide Telegram bot token and chat ID.")
+            return False
+        url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
+        resp = requests.post(url, data={'chat_id': telegram_chat_id, 'text': message}, timeout=15)
+        if resp.status_code >= 400:
+            st.error(f"Telegram send failed: {resp.text}")
+            return False
+        return True
+    except requests.RequestException as exc:
+        st.error(f"Push notification failed: {exc}")
+        return False
 
 def display_dashboard(df, demand_multiplier=1.0, lead_time_days: int = 7, profit_per_unit: float = 50.0):
     """

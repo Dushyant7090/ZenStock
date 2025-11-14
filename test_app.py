@@ -1,99 +1,51 @@
-"""
-Quick test script to verify ZenStock functionality
-"""
-import pandas as pd
-import numpy as np
+"""Pytest sanity checks for ZenStock core helpers."""
+
 from datetime import datetime, timedelta
 
-def test_data_loading():
-    """Test CSV data loading"""
-    try:
-        df = pd.read_csv('sales_data.csv')
-        print("✅ CSV loading successful")
-        print(f"   - Shape: {df.shape}")
-        print(f"   - Columns: {list(df.columns)}")
-        print(f"   - Products: {df['Product'].unique()}")
-        return df
-    except Exception as e:
-        print(f"❌ CSV loading failed: {e}")
-        return None
+import pandas as pd
+import pytest
 
-def test_data_preprocessing(df):
-    """Test data preprocessing"""
-    try:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df['Quantity Sold'] = pd.to_numeric(df['Quantity Sold'], errors='coerce')
-        df['Current Stock'] = pd.to_numeric(df['Current Stock'], errors='coerce')
-        df = df.dropna()
-        print("✅ Data preprocessing successful")
-        print(f"   - Date range: {df['Date'].min()} to {df['Date'].max()}")
-        return df
-    except Exception as e:
-        print(f"❌ Data preprocessing failed: {e}")
-        return None
 
-def test_forecasting(df):
-    """Test basic forecasting logic"""
-    try:
-        products = df['Product'].unique()
-        results = []
-        
-        for product in products:
-            product_data = df[df['Product'] == product]
-            current_stock = product_data['Current Stock'].iloc[-1]
-            avg_daily_sales = product_data['Quantity Sold'].mean()
-            
-            if avg_daily_sales > 0:
-                days_until_zero = current_stock / avg_daily_sales
-                zero_date = datetime.now() + timedelta(days=days_until_zero)
-                
-                # Determine status
-                if days_until_zero < 7:
-                    status = "🔴 Critical"
-                elif days_until_zero < 14:
-                    status = "🟡 Warning"
-                else:
-                    status = "🟢 Safe"
-                
-                results.append({
-                    'Product': product,
-                    'Current Stock': int(current_stock),
-                    'Avg Daily Sales': f"{avg_daily_sales:.1f}",
-                    'Days Until Zero': f"{days_until_zero:.0f}",
-                    'Status': status
-                })
-        
-        print("✅ Forecasting logic successful")
-        for result in results:
-            print(f"   - {result['Product']}: {result['Status']} ({result['Days Until Zero']} days)")
-        
-        return results
-    except Exception as e:
-        print(f"❌ Forecasting failed: {e}")
-        return None
+@pytest.fixture(scope="module")
+def raw_df() -> pd.DataFrame:
+    return pd.read_csv('sales_data.csv')
 
-def main():
-    print("🧪 Testing ZenStock Core Functionality")
-    print("=" * 50)
-    
-    # Test data loading
-    df = test_data_loading()
-    if df is None:
-        return
-    
-    # Test preprocessing
-    df = test_data_preprocessing(df)
-    if df is None:
-        return
-    
-    # Test forecasting
-    results = test_forecasting(df)
-    if results is None:
-        return
-    
-    print("\n🎉 All tests passed! ZenStock is ready to run.")
-    print("\nTo start the application, run:")
-    print("streamlit run app.py")
 
-if __name__ == "__main__":
-    main()
+@pytest.fixture(scope="module")
+def df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    processed = raw_df.copy()
+    processed['Date'] = pd.to_datetime(processed['Date'])
+    processed['Quantity Sold'] = pd.to_numeric(processed['Quantity Sold'], errors='coerce')
+    processed['Current Stock'] = pd.to_numeric(processed['Current Stock'], errors='coerce')
+    return processed.dropna().sort_values('Date')
+
+
+def test_data_loading(raw_df: pd.DataFrame):
+    required_columns = {'Date', 'Product', 'Quantity Sold', 'Current Stock'}
+    assert not raw_df.empty
+    assert required_columns.issubset(raw_df.columns)
+    assert raw_df['Product'].nunique() > 0
+
+
+def test_data_preprocessing(df: pd.DataFrame):
+    assert pd.api.types.is_datetime64_any_dtype(df['Date'])
+    assert pd.api.types.is_numeric_dtype(df['Quantity Sold'])
+    assert pd.api.types.is_numeric_dtype(df['Current Stock'])
+    assert df.isna().sum().sum() == 0
+
+
+def test_forecasting(df: pd.DataFrame):
+    products = df['Product'].unique()
+    assert len(products) > 0
+
+    for product in products:
+        product_data = df[df['Product'] == product]
+        current_stock = product_data['Current Stock'].iloc[-1]
+        avg_daily_sales = product_data['Quantity Sold'].mean()
+        assert avg_daily_sales >= 0
+
+        if avg_daily_sales > 0:
+            days_until_zero = current_stock / avg_daily_sales
+            zero_date = datetime.now() + timedelta(days=days_until_zero)
+            assert isinstance(zero_date, datetime)
+            assert days_until_zero >= 0
