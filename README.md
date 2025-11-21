@@ -1,6 +1,6 @@
 # 📦 ZenStock - Smart Inventory Management Tool
 
-> **🏆 Hackathon-Winning AI-Powered Inventory Management System**
+> ** AI-Powered Inventory Management System**
 
 ZenStock is an intelligent inventory management tool that predicts stock depletion dates and provides actionable restock recommendations using advanced AI forecasting techniques.
 
